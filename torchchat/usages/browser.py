@@ -10,6 +10,7 @@ logger.setLevel(logging.DEBUG)
 
 from openai import OpenAI
 
+st.set_page_config(page_title="torchchat", page_icon="🤖")
 st.title("torchchat")
 
 
