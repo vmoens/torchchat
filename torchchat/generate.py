@@ -756,6 +756,7 @@ class Generator:
             prompt (Union[str, List[Any]]): Prompt or list of dialog.
             image_prompts (Optional[List[str | Image.Image]]): List of image prompts. Used only with Llama 3.2 11B.
             max_new_tokens (Optional[int]): Maximum number of new tokens to generate. Used only with Llama 3.2 11B.
+            max_seq_len (Optional[int]): Maximum sequence length, used for padding. Used only with Llama 3.2 11B.
 
         Returns:
             Tuple[torch.Tensor, Optional[Dict[str, Any]]]: Encoded prompt and batch config for multimodal models.
@@ -791,6 +792,11 @@ class Generator:
         assert (
             max_new_tokens is not None
         ), "max_new_tokens must be specified for Flamingo models"
+
+        """
+        Step 1: Convert prompts (prompts + image_prompts) into a list of
+        torchtune Messages
+        """
 
         image_found = False
         messages = []
@@ -846,12 +852,22 @@ class Generator:
             )
         )
 
+
+        """
+        Step 2: Transform the list of Messages into consumable tokens input
+        """
+
         transform = llama3_2_vision_transform(str(self.tokenizer_args.tokenizer_path))
 
         device = torch.device(device=self.builder_args.device)
 
         with device, set_default_dtype(self.dtype):
             data = transform({"messages": messages}, inference=True)
+
+
+            """
+            Step 3: Construct the batch configs for Llama 3.2 11B
+            """
 
             if image_found:
                 batch = padded_collate_tiled_images_and_mask(
