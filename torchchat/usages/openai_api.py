@@ -310,25 +310,10 @@ class OpenAiApiGenerator(Generator):
         Returns:
             Modle inputs.
         """
-        messages = completion_request.messages
-
-        # Not Llama 3.2 11B
-        if not isinstance(self.model, FlamingoModel):
-            prompt = [
-                {"role": message["role"], "content": message["content"]}
-                for message in messages
-            ]
-            return self._gen_model_input(
-                prompt=prompt, max_new_tokens=completion_request.max_tokens
-            )
-
-        # Llama 3.2 11B
-
         prompt = [
             {"role": message["role"], "content": message["content"]}
-            for message in messages
+            for message in completion_request.messages
         ]
-
         return self._gen_model_input(
             prompt=prompt, max_new_tokens=completion_request.max_tokens
         )
