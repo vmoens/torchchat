@@ -794,44 +794,49 @@ class Generator:
 
         image_found = False
         messages = []
-        for message in prompt:
-            if isinstance(message["content"], str):
-                messages.append(Message(**message))
+        if isinstance(prompt, str):
+            image_found = images is not None
+            content = [{"type": "text", "content": prompt}]
 
-            elif isinstance(message["content"], list):
-                images = None
-                for content_dict in message["content"]:
-                    if content_dict["type"] == "text":
-                        prompt_arg = content_dict["text"]
-                    elif content_dict["type"] == "image_url":
-                        assert (
-                            images is None
-                        ), "At most one image is supported at the moment"
+            if image_found:
+                content = [{"type": "image", "content": images[0]}] + content
+                messages = [Message(role="user", content=content)]
 
-                        base64_decoded = base64.b64decode(
-                            content_dict["image_url"].split(";base64,")[1]
+        else:
+            for message in prompt:
+                if isinstance(message["content"], str):
+                    messages.append(Message(**message))
+
+                elif isinstance(message["content"], list):
+                    images = None
+                    for content_dict in message["content"]:
+                        if content_dict["type"] == "text":
+                            prompt_arg = content_dict["text"]
+                        elif content_dict["type"] == "image_url":
+                            assert (
+                                images is None
+                            ), "At most one image is supported at the moment"
+
+                            base64_decoded = base64.b64decode(
+                                content_dict["image_url"].split(";base64,")[1]
+                            )
+                            images = [Image.open(BytesIO(base64_decoded))]
+                            image_found = True
+
+                    is_multimodal = images is not None
+                    content = [{"type": "text", "content": prompt_arg}]
+                    
+                    if is_multimodal:
+                        content = [{"type": "image", "content": images[0]}] + content
+
+                    messages.append(
+                        Message(
+                            role=message["role"],
+                            content=content,
                         )
-                        images = [Image.open(BytesIO(base64_decoded))]
-                        image_found = True
-
-                is_multimodal = images is not None
-                content = [{"type": "text", "content": prompt_arg}]
-                
-                if is_multimodal:
-                    content = [{"type": "image", "content": images[0]}] + content
-
-                messages.append(
-                    Message(
-                        role=message["role"],
-                        content=content,
                     )
-                )
-        messages.append(
-            Message(
-                role="assistant",
-                content="",
-            )
-        )
+
+        messages.append(Message(role="assistant", content=""))
 
         transform = llama3_2_vision_transform(str(self.tokenizer_args.tokenizer_path))
 
@@ -857,21 +862,24 @@ class Generator:
                 batch = {}
 
             total_response_length = seq_len + max_new_tokens
-            batch["causal_mask"] = torch.nn.functional.pad(
-                torch.tril(
+            batch["causal_mask"] = torch.tril(
                     torch.ones(
                         size=(total_response_length, total_response_length),
                         dtype=torch.bool,
                     )
-                ),
-                (
-                    0,
-                    max_seq_len - total_response_length,
-                    0,
-                    max_seq_len - total_response_length,
-                ),
-                value=0,
-            )
+                )
+
+            if isinstance(prompt, list):
+                batch["causal_mask"] = torch.nn.functional.pad(
+                    batch["causal_mask"],   
+                    (
+                        0,
+                        max_seq_len - total_response_length,
+                        0,
+                        max_seq_len - total_response_length,
+                    ),
+                    value=0,
+                )
 
         logging.debug(encoded)
         return encoded, batch
