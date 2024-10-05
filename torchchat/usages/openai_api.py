@@ -4,24 +4,16 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import base64
 import os
 import time
 import uuid
 
 from abc import ABC
 from dataclasses import dataclass
-from io import BytesIO
 from pwd import getpwuid
 from typing import Any, Dict, List, Optional, Union
 
-import torch
-
-from PIL import Image
-
-from torchtune.data import Message, padded_collate_tiled_images_and_mask
-
-from torchtune.models.llama3_2_vision._model_builders import llama3_2_vision_transform
+from torchtune.data import Message
 
 from torchchat.cli.download import is_model_downloaded, load_model_configs
 from torchchat.generate import Generator, GeneratorArgs
