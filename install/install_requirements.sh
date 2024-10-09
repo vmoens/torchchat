@@ -47,10 +47,11 @@ fi
 # NOTE: If a newly-fetched version of the executorch repo changes the value of
 # PYTORCH_NIGHTLY_VERSION, you should re-run this script to install the necessary
 # package versions.
-PYTORCH_NIGHTLY_VERSION=dev20240913
+
+PYTORCH_NIGHTLY_VERSION=dev20241002
 
 # Nightly version for torchvision
-VISION_NIGHTLY_VERSION=dev20240913
+VISION_NIGHTLY_VERSION=dev20241002
 
 # Nightly version for torchtune
 TUNE_NIGHTLY_VERSION=dev20240928
@@ -67,6 +68,9 @@ TUNE_NIGHTLY_VERSION=dev20240928
 if [[ -x "$(command -v nvidia-smi)" ]];
 then
   TORCH_NIGHTLY_URL="https://download.pytorch.org/whl/nightly/cu121"
+elif [[ -x "$(command -v rocminfo)" ]];
+then
+  TORCH_NIGHTLY_URL="https://download.pytorch.org/whl/nightly/rocm6.2"
 else
   TORCH_NIGHTLY_URL="https://download.pytorch.org/whl/nightly/cpu"
 fi

@@ -19,15 +19,15 @@ import torch
 
 from PIL import Image
 
+from torchtune.data import Message, padded_collate_tiled_images_and_mask
+
+from torchtune.models.llama3_2_vision._model_builders import llama3_2_vision_transform
+
 from torchchat.cli.download import is_model_downloaded, load_model_configs
 from torchchat.generate import Generator, GeneratorArgs
 from torchchat.model import FlamingoModel
 
 from torchchat.utils.build_utils import device_sync
-
-from torchtune.data import Message, padded_collate_tiled_images_and_mask
-
-from torchtune.models.llama3_2_vision._model_builders import llama3_2_vision_transform
 
 
 """Dataclasses defined around the objects used the OpenAI API Chat specification.
@@ -291,7 +291,9 @@ class OpenAiApiGenerator(Generator):
             )
         except:
             self.max_seq_length = 2048
-            print(f"can not find max_seq_length in model config, use default value: {self.max_seq_length}")
+            print(
+                f"can not find max_seq_length in model config, use default value: {self.max_seq_length}"
+            )
         # The System fingerprint is a unique identifier for the model and its configuration.
         self.system_fingerprint = (
             f"{self.builder_args.device}_{self.builder_args.precision}"
@@ -310,31 +312,26 @@ class OpenAiApiGenerator(Generator):
         """
         messages = completion_request.messages
 
-        prompt = None
-        images = None
+        # Not Llama 3.2 11B
+        if not isinstance(self.model, FlamingoModel):
+            prompt = [
+                {"role": message["role"], "content": message["content"]}
+                for message in messages
+            ]
+            return self._gen_model_input(
+                prompt=prompt, max_new_tokens=completion_request.max_tokens
+            )
 
-        for message in messages:
-            torchtune_contents = []
-            if isinstance(message["content"], list):
-                for content_dict in message["content"]:
-                    if content_dict["type"] == "text":
-                        assert (
-                            prompt is None
-                        ), "At most one text prompt is supported for each request"
-                        prompt = content_dict["text"]
-                    elif content_dict["type"] == "image_url":
-                        assert (
-                            images is None
-                        ), "At most one image is supported at the moment"
+        # Llama 3.2 11B
 
-                        base64_decoded = base64.b64decode(
-                            content_dict["image_url"].split(";base64,")[1]
-                        )
-                        images = [Image.open(BytesIO(base64_decoded))]
+        prompt = [
+            {"role": message["role"], "content": message["content"]}
+            for message in messages
+        ]
 
-        assert prompt is not None, "Text prompt must be specified in the request"
-
-        return self._gen_model_input(prompt, images, completion_request.max_tokens)
+        return self._gen_model_input(
+            prompt=prompt, max_new_tokens=completion_request.max_tokens
+        )
 
     def chunked_completion(self, completion_request: CompletionRequest):
         """Handle a chat completion request and yield a chunked response.
@@ -361,27 +358,10 @@ class OpenAiApiGenerator(Generator):
 
         # Initialize counters for chunk responses and encode the prompt.
         id = str(uuid.uuid4())
-
         device_sync(device=self.builder_args.device)
-
-        # If the underlying model is LLama3.2 11B, used unified processing 
-        if isinstance(self.model, FlamingoModel): 
-            encoded, batch = self._gen_model_inputs_from_openai_completion_request(
-                completion_request
-            )
-        else:
-            # Else use the legacy formatting logic
-            tokens = self.chat_formatter.encode_dialog_prompt(
-                dialog=[
-                    {"role": message["role"], "content": message["content"]}
-                    for message in completion_request.messages
-                ]
-            )
-            print("tokens:", self.tokenizer.decode(tokens), flush=True)
-            encoded = torch.tensor(
-                tokens, dtype=torch.int, device=self.builder_args.device
-            )
-            batch = None
+        encoded, batch = self._gen_model_inputs_from_openai_completion_request(
+            completion_request
+        )
 
         idx = 0
         start_pos = 0
@@ -396,7 +376,7 @@ class OpenAiApiGenerator(Generator):
             encoded_prompt=encoded,
             temperature=float(completion_request.temperature),
             chat_mode=False,
-            sequential_prefill=False,
+            sequential_prefill=True,
         )
 
         def callback(x, *, done_generating=False):

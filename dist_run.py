@@ -10,20 +10,23 @@
 
 import argparse
 import os
+from enum import auto, Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed.pipelining import PipelineStage, ScheduleGPipe
+from torchchat.cli.builder import _initialize_tokenizer, TokenizerArgs
 
 from torchchat.distributed.logging_utils import SingletonLogger
 
 # TODO - these are not distributed specific, consider moving to new package
-from torchchat.distributed.safetensor_utils import (
+from torchchat.distributed.checkpoint_utils import (
     get_hf_config_file,
-    get_hf_weight_map_and_path,
-    load_safetensor_weights,
+    load_weights_from_hf_format,
+    load_weights_from_torchchat_format,
 )
 from torchchat.distributed.utils import (
     bytes_to_readable,
@@ -33,8 +36,6 @@ from torchchat.distributed.utils import (
     get_num_params,
     GPUMemoryMonitor,
 )
-from torch.distributed.pipelining import PipelineStage, ScheduleGPipe
-from torchchat.cli.builder import _initialize_tokenizer, TokenizerArgs
 from torchchat.model import ModelArgs, Transformer, TransformerArgs
 from torchchat.utils.build_utils import set_precision
 
@@ -49,6 +50,7 @@ except ImportError:
 
 
 logger = SingletonLogger.get_logger()
+_tokenizer_type = None  # global variable to store the tokenizer type
 
 # Using model name to identify the model to load, for example "llama2-7b-chat".
 # You can change it to other values listed below.
@@ -57,6 +59,11 @@ NAME_TO_DISTRIBUTION_AND_DTYPE = {
     "llama2-7b-chat": ("meta-llama/Llama-2-7b-chat-hf", torch.float16),
     "llama3": ("meta-llama/Meta-Llama-3-8B-Instruct", torch.bfloat16),
 }
+
+
+class TokenizerType(Enum):
+    Tiktoken = auto()
+    SentencePiece = auto()
 
 
 def _init_distributed():
@@ -80,7 +87,10 @@ def _build_chat_tokenizer(
     model_name: str,
     model_base_name: Optional[str] = None,
 ) -> SentencePieceProcessor | TiktokenTokenizer:
-    """Builds a tokenizer for the given model name."""
+    """Builds a tokenizer for the given model name, and sets the global tokenizer type variable"""
+
+    global _tokenizer_type
+
     # Try to infer the model base name from the model name:
     # e.g. "llama2-7b-chat" -> "llama2"
     if model_base_name is None:
@@ -107,29 +117,45 @@ def _build_chat_tokenizer(
     logger.info(
         f"using tokenizer = {tokenizer.__class__.__module__}.{tokenizer.__class__.__name__}"
     )
+    # set global variable _tokenizer_type
+    if isinstance(tokenizer, TiktokenTokenizer):
+        _tokenizer_type = TokenizerType.Tiktoken
+    elif isinstance(tokenizer, SentencePieceProcessor):
+        _tokenizer_type = TokenizerType.SentencePiece
+    else:
+        raise ValueError(f"Unknown tokenizer type: {tokenizer.__class__}")
+
+    logger.info(f"tokenizer type = {_tokenizer_type}")
     return tokenizer
 
 
-def _load_model_weights(stage_module, distribution, device, model_config):
+def _load_model_weights(
+    stage_module: torch.nn.Module,
+    distribution: str,
+    device: torch.device,
+    model_config: ModelArgs,
+    chpt_from: str,
+):
     """Load the weights from the safetensor file(s) into the model stage.
     Model config is needed b/c we permute wq and wk weights based on attn heads.
+
+    Args:
+        stage_module (torch.nn.Module): The model stage to load the weights into.
+        distribution (str): The distribution name, e.g. "meta-llama/Meta-Llama-3-8B-Instruct".
+        device (torch.device): The device to load the weights onto.
+        model_config (ModelArgs): The model config.
+        chpt_from (str): The checkpoint format to load the weights from, e.g. "torchchat" or "hf".
     """
-
-    weight_map, weight_path, key_map = get_hf_weight_map_and_path(distribution)
-
-    num_loaded_weights, num_missing_weights = load_safetensor_weights(
-        stage_module,
-        weight_map,
-        weight_path,
-        key_map,
-        device,
-        model_config=model_config,
-    )
-    logger.info(
-        f"Success - Loaded {num_loaded_weights} weights, {num_missing_weights} missing weights"
-    )
-    if num_missing_weights > 0:
-        raise ValueError(f"Missing {num_missing_weights} weights")
+    if chpt_from == "hf":
+        # This format stands for: index file + multiple binary files
+        load_weights_from_hf_format(stage_module, distribution, device, model_config)
+    elif chpt_from == "torchchat":
+        # This format stands for:
+        # single binary file, OR
+        # multiple binary files without index files.
+        load_weights_from_torchchat_format(stage_module, distribution, device, model_config)
+    else:
+        raise ValueError(f"Unknown checkpoint format: {chpt_from}")
 
 
 def _encode_strings(
@@ -189,23 +215,50 @@ def _create_padded_prompts(
 
 def _batch_decode_next_tokens(
     output: torch.Tensor,
-    pos: int,
+    pos: List[int],
+    step: int = -1,
+    temperature: float = 1.0,
+    topk: int = 10,
 ) -> torch.Tensor:
     """
-    Decode the next token for each prompt in the batch.
+    Decode the next token for each prompt in the batch. Adds temperature option for non-deterministic decoding.
+
     Args:
         output (torch.Tensor): The output tensor to decode.
-        pos: the position of the `output` to decode in the sequence length dimension.
+        pos (List[int]): The positions of the `output` to decode in the sequence length dimension.
+        step (int): Step indicator. If -1, use positions from `pos`. Otherwise, use the first token.
+        temperature (float): Sampling temperature for non-deterministic decoding.
 
     Returns:
-        Decoded token ids.
+        torch.Tensor: Decoded token ids.
     """
-    # Take the next token logits for each prompt
-    next_token_logits = output[:, pos, :]
-    # Argmax (deterministic) TODO: add temperature
-    next_token = torch.argmax(next_token_logits, dim=-1)
+    batch_size, seq_len, vocab_size = output.shape
+
+    if step != -1:
+        # `pos` is not provided, so we can use the first token
+        next_token_logits = output[:, 0, :]
+    else:
+        # get the logits for each prompt at the specified positions
+        next_token_logits = output[torch.arange(batch_size), torch.tensor(pos) - 1]
+
+    if temperature != 1.0:
+        next_token_logits = next_token_logits / temperature
+
+    # Uses top-k sampling if temperature is not 1.0, otherwise use argmax
+    if temperature != 1.0:
+        top_k = min(topk, vocab_size)  # Ensure top-k is not greater than vocab size
+        top_k_logits, top_k_indices = torch.topk(next_token_logits, k=top_k, dim=-1)
+        probs = torch.softmax(top_k_logits, dim=-1)
+        next_token_indices = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        next_tokens = top_k_indices.gather(
+            -1, next_token_indices.unsqueeze(-1)
+        ).squeeze(-1)
+    else:
+        # Argmax (deterministic)
+        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
     # Token ids in int tensor form
-    return next_token
+    return next_tokens
 
 
 def _update_padded_sequence(
@@ -218,9 +271,36 @@ def _update_padded_sequence(
         # logger.info(f"updated prompt {i} with new token {new_token[i, 0]}")
 
 
+# Decode token id into string and print it
+def _decode_in_flight(token, tokenizer, tp_rank):
+    """decode token ids for all prompts in the batch and log them"""
+    # `token` is a tensor of shape (batch_size, 1).
+    # For TiktokenTokenizer, we need to squeeze it to 1D.
+    # For SentencePieceProcessor, we don't.
+    if isinstance(tokenizer, TiktokenTokenizer):
+        token = torch.squeeze(token, dim=1)
+    token_str = tokenizer.decode(token.tolist())
+    # print the token string on tp rank 0
+    if tp_rank == 0:
+        logger.info(
+            f"{color.green} responses ====>>>> "
+            f"{color.blue} {token_str} {color.reset}"
+        )
+
+
 def _cleanup():
     dist.barrier()
     dist.destroy_process_group()
+
+
+prompt = [
+    "What is Snow?",
+    # "Can you explain what is the purpose of back propagation in neural networks?",
+    "Who is Santa Claus?",
+    "Where does Santa live?",
+    # "Who is Abraham Lincoln?",
+    # "How are models trained?",
+]
 
 
 def main(args):
@@ -233,7 +313,7 @@ def main(args):
     logger.info(f"{color.yellow} {gpu_memory_monitor.get_device_info()}{color.reset}")
 
     distribution, model_dtype = NAME_TO_DISTRIBUTION_AND_DTYPE[model_name]
-    logger.info(f"Using HF model weights from {distribution} and dtype {model_dtype}")
+    logger.info(f"Using model weights from {distribution} and dtype {model_dtype}")
 
     # Model-level config
     model_config = ModelArgs.from_name(distribution)
@@ -281,19 +361,30 @@ def main(args):
     config.stage_idx = pp_rank
     config.n_stages = pp_degree
 
-    with device:
+    with torch.device("meta"):
         # TODO: we should create model instead of Transformer
         model = Transformer(config)
 
     # Distribute model on TP mesh
+    # (Surprisingly, this works even though model is on meta device and mesh is of
+    # cuda devices)
     model.distribute(tp_mesh)
     if rank == 0:
         logger.info(f"Model: {model}")
 
+    # Load weights
+    logger.info(f"Loading weights for {pp_rank=} on {device=}")
+    with CUDATrackTime() as timer:
+        _load_model_weights(model, distribution, device, config, args.chpt_from)
+
+    logger.info(
+        f"{color.green}Total weight loading time: {timer.get_time()} {timer.unit} for rank {rank}{color.reset}"
+    )
+
     # Batch size. Since we push batches dynamically through the pipeline rather
     # than chunking them, this is effectively micro-batch size in pipeline
     # sense. Thus it is interchangeable with micro-batch size below.
-    batch_size = 4
+    batch_size = len(prompt)
     seqlen_prefill = 1024  # sequence length
     dim = 4096  # embedding dimension
 
@@ -305,17 +396,8 @@ def main(args):
     # lanes.
     # TODO: bump up the lane count
     pipeline_lanes = 1
-    model.setup_caches(batch_size, seqlen_prefill, cache_lanes=pipeline_lanes)
-
-    # Load weights
-    logger.info(f"Loading weights for {pp_rank=} on {device=}")
-    with CUDATrackTime() as timer:
-        _load_model_weights(model, distribution, device=device, model_config=config)
-        model.to(device)
-
-    logger.info(
-        f"{color.green}Total weight loading time: {timer.get_time()} {timer.unit} for rank {rank}{color.reset}"
-    )
+    with device:
+        model.setup_caches(batch_size, seqlen_prefill, cache_lanes=pipeline_lanes)
 
     # info on stage size and params
     stage_size = get_module_size(model)
@@ -331,7 +413,9 @@ def main(args):
 
     # Helper function to get example inputs and outputs for the stages.
     def get_example_ins_outs(seqlen: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        mb_ids = torch.randint(0, config.vocab_size, (batch_size, seqlen), device=device)
+        mb_ids = torch.randint(
+            0, config.vocab_size, (batch_size, seqlen), device=device
+        )
         activation = torch.rand(
             batch_size, seqlen, dim, device=device, dtype=model_dtype
         )
@@ -362,13 +446,6 @@ def main(args):
     # pipelining effect.
     prefiller = ScheduleGPipe(prefill_stage, 1)
 
-    prompt = [
-        "What is a computer?",
-        "Where does Santa live?",
-        "Who is Abraham Lincoln?",
-        "How are models trained?",
-    ]
-
     start_pos = 0
 
     # Need these global ids due to the API definition of dist.send and recv
@@ -384,10 +461,6 @@ def main(args):
     padded_sequence, prompt_lengths = _create_padded_prompts(
         input_ids, tokenizer, seqlen_prefill, start_pos, device
     )
-    # TODO: figure out how to set input_pos for each prompt in the batch then we
-    # can remove this limitation.
-    s = set(prompt_lengths)
-    assert len(s) == 1, f"prompt_lengths should be the same, got {s}"
 
     # Need these global ids due to the API definition of dist.send and recv
     first_pp_rank_global_id = dist.get_global_rank(pp_group, first_pp_rank)
@@ -416,23 +489,13 @@ def main(args):
         f"{color.green}Prefilling time: {timer.get_time()} {timer.unit} for rank {rank}{color.reset}"
     )
 
-    # Decode token id into string and print it
-    def decode_in_flight(token):
-        # Make a 2D tensor with ids on row dimension
-        unsqueezed = torch.unsqueeze(token, 1)
-        token_str = tokenizer.decode(unsqueezed.tolist())
-        if tp_rank == 0:
-            logger.info(
-                f"{color.green} responses ====>>>> "
-                f"{color.blue} {token_str} {color.reset}"
-            )
-
     # Decode the output -- first generated token
     if pp_rank == last_pp_rank:
-        new_token = _batch_decode_next_tokens(output, prompt_lengths[0] - 1)
+        logger.info(f"{color.green}Decoding...{prompt_lengths=}{color.reset}")
+        new_token = _batch_decode_next_tokens(output, prompt_lengths)
         res.append(new_token)
         if not args.disable_in_flight_decode:
-            decode_in_flight(new_token)
+            _decode_in_flight(new_token, tokenizer, tp_rank)
 
     # seqlen = 1 now
     seqlen_decode = 1
@@ -451,7 +514,7 @@ def main(args):
         group=pp_group,
     )
     # create schedule
-    decorder = ScheduleGPipe(decode_stage, 1)
+    decoder = ScheduleGPipe(decode_stage, 1)
 
     # Decoding
     with torch.no_grad(), CUDATrackTime() as timer:
@@ -474,18 +537,18 @@ def main(args):
 
             # Run data through pipeline
             if pp_rank == first_pp_rank:
-                output = decorder.step(new_token, **kwargs)
+                output = decoder.step(new_token, **kwargs)
             elif pp_rank == last_pp_rank:
-                output = decorder.step(**kwargs)
+                output = decoder.step(**kwargs)
             else:  # middle pp ranks
-                decorder.step(**kwargs)
+                decoder.step(**kwargs)
 
             # Decode the output
             if pp_rank == last_pp_rank:
-                new_token = _batch_decode_next_tokens(output, 0)
+                new_token = _batch_decode_next_tokens(output, prompt_lengths, step)
                 res.append(new_token)
                 if not args.disable_in_flight_decode:
-                    decode_in_flight(new_token)
+                    _decode_in_flight(new_token, tokenizer, tp_rank)
 
             # Increment input position
             input_pos += 1
@@ -498,13 +561,25 @@ def main(args):
 
     # output formatted response via last pp group and tp rank 0
     if pp_rank == last_pp_rank and tp_rank == 0:
-        # `res` is a list of tensors, each being a batch of generated token ids
-        res = torch.stack(res, dim=1)
+        # `res` is a list of tensors, each being a batch of generated token ids.
+        # We need to concatenate them to get the full sequence of generated
+        # token ids. Thus cat'ing along dim 1.
+        res = torch.cat(res, dim=1)
         res_list = res.tolist()
-        response = tokenizer.decode(res_list)
-        for i in range(len(response)):
-            logger.info(f"Prompt: {color.green}{prompt[i]} {color.reset}")
-            logger.info(f"Response: {color.red}{response[i]} {color.reset}")
+        if _tokenizer_type == TokenizerType.Tiktoken:
+            # For TiktokenTokenizer, we need to decode prompt by prompt.
+            # TODO: is there a better way to do this?
+            responses = [tokenizer.decode(sequence) for sequence in res_list]
+        elif _tokenizer_type == TokenizerType.SentencePiece:  # SentencePieceProcessor
+            # For SentencePieceProcessor, we can decode the entire 2D list at once.
+            responses = tokenizer.decode(res_list)
+        else:
+            raise ValueError(f"Unknown tokenizer type {_tokenizer_type}")
+
+        # Show prompts and responses
+        for prompt_text, response_text in zip(prompt, responses):
+            logger.info(f"Prompt: {color.green}{prompt_text} {color.reset}")
+            logger.info(f"Response: {color.red}{response_text} {color.reset}")
 
     # Cleanup
     _cleanup()
@@ -533,6 +608,13 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Whether to decode token into string in flight",
+    )
+    parser.add_argument(
+        "--chpt-from",
+        type=str,
+        default="hf",  # TODO: change to torchchat once we support it well
+        help="Checkpoint format to load from",
+        choices=["hf", "torchchat"],
     )
     args = parser.parse_args()
 
