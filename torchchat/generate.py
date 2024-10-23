@@ -802,6 +802,10 @@ class Generator:
             max_new_tokens is not None
         ), "max_new_tokens must be specified for Flamingo models"
 
+        # Wrap string prompts into a list
+        if isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
+
         image_found = False
         messages = []
         for message in prompt:
@@ -933,9 +937,22 @@ class Generator:
                     self.model_forward, fullgraph=True, **kwargs
                 )
 
-            self.decode_one_token = torch.compile(
-                self.decode_one_token, fullgraph=True, **kwargs
-            )
+            if self.model.config.model_type == ModelType.Flamingo:
+                # Based on https://github.com/pytorch/torchtune/blob/57ab583c84c4a9dcacac23aeabc81f2a679670fe/torchtune/training/_compile.py#L42-L52
+                from torchtune.modules import (
+                    TransformerCrossAttentionLayer,
+                    TransformerSelfAttentionLayer,
+                )
+                decoder = self.model.model.decoder 
+                for m in reversed(list(decoder.modules())):
+                    if isinstance(m, TransformerSelfAttentionLayer) or isinstance(
+                        m, TransformerCrossAttentionLayer
+                    ):
+                        m.compile()
+            else:
+                self.decode_one_token = torch.compile(
+                    self.decode_one_token, fullgraph=True, **kwargs
+                )
 
             if generator_args.compile_prefill:
                 self.prefill = torch.compile(
@@ -951,8 +968,9 @@ class Generator:
         max_seq_length = (
             text_transformer_args.max_seq_length if text_transformer_args else 2048
         )
+
         encoded, batch = self._gen_model_input(
-            [{"role": "user", "content": generator_args.prompt}],
+            generator_args.prompt,
             generator_args.image_prompts,
             generator_args.max_new_tokens,
             max_seq_length,
