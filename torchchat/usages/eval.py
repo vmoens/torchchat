@@ -248,6 +248,9 @@ def _maybe_run_sweeps(func):
         if not isinstance(dtype, list):
             dtype = [dtype]
 
+        if not quantize:
+            return [args], [{}]
+
         sweeps = []
         for q in quantize:
             for dt in dtype:
@@ -277,6 +280,7 @@ def _maybe_run_sweeps(func):
             result = func(config)
             result["sweep"] = sweep
             results.append(result)
+        assert i > -1
         if i > 0:
             display_results(results)
         else:
