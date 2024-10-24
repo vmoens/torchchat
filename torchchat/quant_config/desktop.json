@@ -1,4 +1,5 @@
 {
     "executor": {"accelerator": "fast"},
-    "precision": {"dtype" : "fast16"}
+    "precision": {"dtype" : "fast16"},
+    "linear:int8": {}
 }
