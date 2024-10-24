@@ -39,7 +39,7 @@ from torchchat.utils.build_utils import (
 )
 from torchchat.utils.measure_time import measure_time
 from torchchat.utils.quantize import quantize_model
-
+from tensordict import from_module
 
 @dataclass
 class BuilderArgs:
@@ -586,7 +586,6 @@ def _initialize_model(
                 )
 
         model.to(dtype=builder_args.precision)
-
     print("-----------------------------------------------------------")
     return model
 

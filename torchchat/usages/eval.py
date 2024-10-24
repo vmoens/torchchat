@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import argparse
+import functools
+from copy import copy
 from typing import Callable, Optional
 
 import torch
@@ -33,6 +35,7 @@ import lm_eval
 from lm_eval.evaluator import evaluate
 from lm_eval.models.huggingface import HFLM as eval_wrapper
 from lm_eval.tasks import get_task_dict
+from tensordict import TensorDict, from_module
 
 
 def setup_cache_padded_seq_input_pos_max_seq_length_for_prefill(
@@ -222,7 +225,65 @@ def eval(
     eval_results["times"] = model_eval_wrapper.times
     return eval_results
 
+def _maybe_run_sweeps(func):
 
+    def _refine(args, **kwargs):
+        result = copy(args)
+        for kw, item in kwargs.items():
+            collection = getattr(args, kw)
+            if isinstance(collection, dict):
+                setattr(result, kw, {item: collection[item]})
+            else:
+                setattr(result, kw, item)
+        return result
+
+    def make_sweeps(args):
+        print("making sweeps for", args)
+        result = []
+        quantize = args.quantize
+        device = args.device
+        if not isinstance(device, list):
+            device = [device]
+        dtype = args.dtype
+        if not isinstance(dtype, list):
+            dtype = [dtype]
+
+        sweeps = []
+        for q in quantize:
+            for dt in dtype:
+                for dv in device:
+                    sweep = {"quantize": q, "device": dv, "dtype": dt}
+                    result.append(_refine(args, **sweep))
+                    sweeps.append(sweep)
+        print('result', result)
+        return result, sweeps
+    def display_results(results):
+        r = torch.stack(results)
+        # TODO: process r to json / string here
+        #  we can use r.flatten_keys() to get a flat dictionary, r.to_dict() to get a regular dict
+        #  td["wikitext", "bits_per_byte,none"] will give you a tensor of n_sweeps elements,
+        #  whereas td[0] will give you the results of the first sweep
+        return
+
+    @functools.wraps(func)
+    def new_func(args):
+        # if args has sweeps, run the function across all combinations of these
+        configs, sweeps = make_sweeps(args)
+        results = []
+        i = -1
+        for i, (config, sweep) in enumerate(zip(configs, sweeps)):
+            torch.compiler.reset()
+
+            result = func(config)
+            result["sweep"] = sweep
+            results.append(result)
+        if i > 0:
+            display_results(results)
+        else:
+            return results[0]
+    return new_func
+
+@_maybe_run_sweeps
 def main(args) -> None:
     """Evaluates model on a task from the `lm-evaluation-harness` library.
 
@@ -255,6 +316,8 @@ def main(args) -> None:
         tokenizer,
     )
     tokenizer_args.validate_model(model)
+    model_size = from_module(model).bytes()
+    print(f"model size {model_size/1024/1024: .4f} Mb")
 
     model_forward = lambda x, input_pos: model(x, input_pos)  # noqa
 
@@ -267,7 +330,7 @@ def main(args) -> None:
         )
         torch._inductor.config.coordinate_descent_tuning = False if device == "cpu" else True
 
-    with measure_time("Time to run eval: {time:.02f}s."):
+    with measure_time("Time to run eval: {time:.02f}s.") as timer:
         result = eval(
             model.to(device),
             model_forward,
@@ -278,6 +341,7 @@ def main(args) -> None:
             device=builder_args.device,
             is_pte_model=builder_args.pte_path is not None,
         )
+    exec_time = timer.time
 
     times = torch.tensor(result["times"])
     print(
@@ -302,3 +366,7 @@ def main(args) -> None:
         for metric, val in res.items():
             if val != "N/A":
                 print(f" {metric}: {val if isinstance(val, str) else f'{val:0.4f}'}")
+
+    result["results"]["eval_time"] = exec_time
+    result["results"]["model_size"] = model_size
+    return TensorDict(result["results"])

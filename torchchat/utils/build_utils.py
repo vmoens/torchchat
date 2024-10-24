@@ -233,6 +233,8 @@ def is_mps_available() -> bool:
 
 
 def get_device_str(device) -> str:
+    if isinstance(device, list):
+        return [get_device_str(dev) for dev in device]
     if isinstance(device, str) and device == "fast":
         device = (
             "cuda"

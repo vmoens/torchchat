@@ -151,6 +151,7 @@ def _add_model_config_args(parser, verb: str) -> None:
     model_config_parser.add_argument(
         "--dtype",
         default="fast",
+        nargs='+',
         choices=allowable_dtype_names(),
         help="Override the dtype of the model (default is the checkpoint dtype). Options: bf16, fp16, fp32, fast16, fast",
     )
@@ -166,7 +167,8 @@ def _add_model_config_args(parser, verb: str) -> None:
     model_config_parser.add_argument(
         "--device",
         type=str,
-        default=default_device,
+        default=[default_device],
+        nargs='+',
         choices=["fast", "cpu", "cuda", "mps"],
         help="Hardware device to use. Options: cpu, cuda, mps",
     )
