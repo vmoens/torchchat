@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 import argparse
 import functools
+import json
+import pathlib
 from copy import copy
 from typing import Callable, Optional
 
@@ -23,6 +25,7 @@ from torchchat.cli.cli import add_arguments_for_verb, arg_init
 from torchchat.model import Model
 from torchchat.model_config import model_config
 from torchchat.quant_config import quant_config
+from torchchat.quant_config.flatten_select_quant import get_pandas_df, select_in_df
 from torchchat.utils.build_utils import set_precision
 from torchchat.utils.measure_time import measure_time
 
@@ -250,16 +253,39 @@ def _maybe_run_sweeps(func):
         if not isinstance(dtype, list):
             dtype = [dtype]
 
-        if not quantize:
-            return [args], [{}]
+        if args.compile is None:
+            modes = ["eager", "compile"]
+        elif args.compile:
+            modes = ["compile"]
+        else:
+            modes = ["eager"]
 
+        # If no quantize is passed, just iterate over dtype and device
         sweeps = []
-        for q in quantize:
+        if not quantize:
             for dt in dtype:
                 for dv in device:
-                    sweep = {"quantize": q, "device": dv, "dtype": dt}
+                    sweep = {"device": dv, "dtype": dt}
                     result.append(_refine(args, **sweep))
                     sweeps.append(sweep)
+            return result, sweeps
+
+        # Get the quant options
+        quant_df = get_pandas_df()
+        # TODO: we want to filter the dataframe with the provided quantize schemes,
+        #  device and dtypes.
+        #  We can use select_in_df to get a smaller dataframe that contains all the options
+        #  for the provided lists of kwargs.
+        #  Then we need to go row-by-row in that dataframe and update a copy of the args
+        #  with the new config (defined by that line).
+        for dv in device:
+            # Add other iterations here
+            sub_df = select_in_df(quant_df, device=dv)
+            # Iterate over the rows
+            for index, row in sub_df.iterrows():
+                sweep = row.to_dict()
+                result.append(_refine(args, **sweep))
+                sweeps.append(sweep)
         print('result', result)
         return result, sweeps
     def display_results(results):
